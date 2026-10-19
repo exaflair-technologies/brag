@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "brag.job.v1",
+  "title": "Brag job",
+  "type": "object",
+  "required": ["jobId", "sourceUrl", "state"],
+  "properties": {
+    "jobId": { "type": "string", "minLength": 1 },
+    "sourceUrl": { "type": "string", "format": "uri", "pattern": "^https?://" },
+    "bundleId": { "type": "string", "pattern": "^b_[0-9a-f]{16}$" },
+    "state": { "enum": ["queued", "capturing", "composing", "rendering", "done", "failed"] },
+    "failureReason": { "enum": ["capture_blocked", "capture_failed", "timeout"] }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "state": { "const": "failed" } }, "required": ["state"] },
+      "then": { "required": ["failureReason"] }
+    }
+  ]
+}

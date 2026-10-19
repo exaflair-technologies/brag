@@ -23,3 +23,6 @@ skills-lock.json
 **/.waveform-cache/
 
 .codesk
+
+# Capture worker output (EXA-930)
+service/bundles/
