@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import net from 'node:net';
+import { once } from 'node:events';
 import { describe, it } from 'node:test';
-import { bundleIdFor, captureUrl, CaptureError, normalizeUrl } from './capture.mjs';
+import { bundleIdFor, captureUrl, CaptureError, normalizeUrl, writeBundle } from './capture.mjs';
 import { startEgressProxy } from './proxy.mjs';
 import { isPublicAddress } from './ssrf.mjs';
 import { rewriteCss, rewriteDocument } from './rewrite.mjs';
@@ -70,6 +72,17 @@ describe('isPublicAddress', () => {
 });
 
 describe('egress proxy', () => {
+  it('closes while a client connection is idle', { timeout: 5000 }, async () => {
+    const proxy = await startEgressProxy();
+    const idle = net.connect(Number(new URL(proxy.url).port), '127.0.0.1');
+    await once(idle, 'connect');
+    try {
+      await proxy.close();
+    } finally {
+      idle.destroy();
+    }
+  });
+
   it('refuses CONNECT to loopback, metadata, private, and localhost targets', async () => {
     const proxy = await startEgressProxy();
     try {
@@ -183,12 +196,90 @@ describe('captureUrl cache', () => {
   });
 });
 
+describe('writeBundle manifest', () => {
+  it('records the size and hash of rewritten CSS and totals the files on disk', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'brag-bundle-test-'));
+    try {
+      await mkdir(join(dir, 'assets'), { recursive: true });
+      await mkdir(join(dir, 'screenshots'), { recursive: true });
+      const originalCss = Buffer.from('.a{background:url(/hero.png)}');
+      const captured = {
+        html: '<html><head><link rel="stylesheet" href="/site.css"></head><body><img src="/hero.png"></body></html>',
+        screenshots: {},
+        bodies: [
+          { url: 'https://example.com/site.css', mimeType: 'text/css', type: 'Stylesheet', data: originalCss },
+          { url: 'https://example.com/hero.png', mimeType: 'image/png', type: 'Image', data: Buffer.from('89504e47', 'hex') },
+        ],
+        missing: [],
+      };
+      const manifest = await writeBundle(dir, {
+        url: normalizeUrl('https://example.com/'),
+        finalUrl: 'https://example.com/',
+        captured,
+        egress: [],
+        startedAt: Date.now(),
+        skipped: [],
+      });
+
+      const css = manifest.assets.find((asset) => asset.mimeType === 'text/css');
+      const onDiskCss = await readFile(join(dir, css.file));
+      assert.notEqual(onDiskCss.toString(), originalCss.toString());
+      assert.equal(css.bytes, onDiskCss.length);
+      assert.equal(css.sha256, createHash('sha256').update(onDiskCss).digest('hex'));
+
+      let total = (await readFile(join(dir, manifest.document.file))).length;
+      for (const asset of manifest.assets) {
+        const onDisk = await readFile(join(dir, asset.file));
+        assert.equal(asset.bytes, onDisk.length, asset.file);
+        assert.equal(asset.sha256, createHash('sha256').update(onDisk).digest('hex'), asset.file);
+        total += onDisk.length;
+      }
+      assert.equal(manifest.totalBytes, total);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('live capture', { skip: process.env.BRAG_LIVE_TESTS !== '1' }, () => {
+  for (const raw of ['http://example.com/', 'https://httpbin.org/redirect-to?url=http%3A%2F%2Fexample.com%2F']) {
+    it(`resolves and releases the proxy for ${raw}`, { timeout: 180000 }, async () => {
+      const cacheRoot = await mkdtemp(join(tmpdir(), 'brag-live-test-'));
+      try {
+        const result = await captureUrl(raw, {
+          cacheRoot,
+          chromeBin: process.env.BRAG_CHROME_BIN ?? '/usr/bin/google-chrome',
+        });
+        assert.equal(result.cacheHit, false);
+        assert.ok(result.manifest.assets.length + result.manifest.document.bytes > 0);
+      } finally {
+        await rm(cacheRoot, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 describe('rewrite', () => {
   const pageUrl = 'https://example.com/index.html';
   const assets = new Map([
     ['https://example.com/style.css', 'aaaa.css'],
     ['https://example.com/hero.png', 'bbbb.png'],
+    ['https://fonts.googleapis.com/css2?family=Roboto&display=swap', 'cccc.css'],
   ]);
+
+  it('localizes stylesheet hrefs whose HTML-escaped ampersands match a captured URL', () => {
+    const html = `<head><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto&amp;display=swap"></head>`;
+    const { html: out, unresolved } = rewriteDocument(html, pageUrl, assets);
+    assert.match(out, /href="assets\/cccc\.css"/);
+    assert.deepEqual(unresolved, []);
+  });
+
+  it('reports unresolved stylesheet hrefs but not plain anchors', () => {
+    const html = `<head><link rel="stylesheet" href="https://fonts.example.net/x.css"></head><body><a href="https://example.com/other">x</a></body>`;
+    const { html: out, unresolved } = rewriteDocument(html, pageUrl, assets);
+    assert.match(out, /href="https:\/\/fonts\.example\.net\/x\.css"/);
+    assert.deepEqual(unresolved, ['https://fonts.example.net/x.css']);
+  });
 
   it('strips scripts and preload links, rewrites refs to local assets, and injects CSP', () => {
     const html = `<html><head><link rel="preload" href="/hero.png"><link rel="stylesheet" href="/style.css"><script>alert(1)</script></head>` +
@@ -201,6 +292,12 @@ describe('rewrite', () => {
     assert.match(out, /srcset="assets\/bbbb\.png 1x, \/missing\.png 2x"/);
     assert.match(out, /<meta http-equiv="Content-Security-Policy" content="default-src 'none'/);
     assert.deepEqual(unresolved, ['https://example.com/missing.png']);
+  });
+
+  it('reports CSS urls it could not localize', () => {
+    const unresolved = new Set();
+    rewriteCss(`@font-face{src:url(https://fonts.example.net/a.woff2)}`, pageUrl, assets, unresolved);
+    assert.deepEqual([...unresolved], ['https://fonts.example.net/a.woff2']);
   });
 
   it('rewrites CSS url() to local assets and leaves unknown urls alone', () => {

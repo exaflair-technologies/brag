@@ -29,6 +29,7 @@ export function startEgressProxy() {
   const events = [];
   const record = (host, decision, reason) => events.push({ host, decision, reason });
 
+  const sockets = new Set();
   const server = http.createServer((req, res) => {
     let target;
     try {
@@ -73,6 +74,11 @@ export function startEgressProxy() {
     });
   });
 
+  server.on('connection', (socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+  });
+
   server.on('connect', (req, clientSocket, head) => {
     const separator = req.url.lastIndexOf(':');
     const hostname = stripBrackets(req.url.slice(0, separator));
@@ -103,7 +109,10 @@ export function startEgressProxy() {
       resolve({
         url: `http://127.0.0.1:${port}`,
         events,
-        close: () => new Promise((done) => server.close(() => done())),
+        close: () => new Promise((done) => {
+          server.close(() => done());
+          sockets.forEach((socket) => socket.destroy());
+        }),
       });
     });
   });

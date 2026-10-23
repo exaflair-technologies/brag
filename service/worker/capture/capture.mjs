@@ -57,6 +57,12 @@ export class CaptureError extends Error {
 
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 
+const BLOCKED_MESSAGES = {
+  port_not_allowed: 'destination port is not 80 or 443',
+  non_public_address: 'destination resolves to a non-public address',
+  scheme_not_allowed: 'destination scheme is not allowed',
+};
+
 export function normalizeUrl(raw) {
   let url;
   try {
@@ -146,6 +152,10 @@ async function capturePage(cdp, url) {
     expression: 'document.documentElement.outerHTML',
     returnByValue: true,
   });
+  const { result: locationResult } = await call('Runtime.evaluate', {
+    expression: 'location.href',
+    returnByValue: true,
+  });
 
   const screenshots = {};
   screenshots.desktop = (await call('Page.captureScreenshot', { format: 'jpeg', quality: 85 })).data;
@@ -168,7 +178,9 @@ async function capturePage(cdp, url) {
     });
   }
 
-  return { html: htmlResult.value, screenshots, bodies, missing };
+  const finalUrl = new URL(locationResult.value);
+  finalUrl.hash = '';
+  return { html: htmlResult.value, finalUrl: finalUrl.href, screenshots, bodies, missing };
 }
 
 function planAssets(bodies, skipped) {
@@ -188,22 +200,24 @@ function planAssets(bodies, skipped) {
     const digest = sha256(data);
     const file = `${digest.slice(0, 16)}${EXTENSIONS[mimeType] ?? '.bin'}`;
     assets.set(url, file);
-    files.push({ url, file, mimeType, data, sha256: digest });
+    files.push({ url, file, mimeType, data });
     totalBytes += data.length;
   }
-  return { assets, files, totalBytes };
+  return { assets, files };
 }
 
-async function writeBundle(tmpDir, { url, finalUrl, captured, egress, startedAt, skipped }) {
-  const { assets, files, totalBytes: assetBytes } = planAssets(captured.bodies, skipped);
-  for (const { file, data } of files) {
-    await writeFile(join(tmpDir, 'assets', file), data);
+export async function writeBundle(tmpDir, { url, finalUrl, captured, egress, startedAt, skipped }) {
+  const { assets, files } = planAssets(captured.bodies, skipped);
+  const written = [];
+  const cssUnresolved = new Set();
+  for (const asset of files) {
+    const data = asset.mimeType === 'text/css'
+      ? Buffer.from(rewriteCss(asset.data.toString('utf8'), asset.url, assets, cssUnresolved))
+      : asset.data;
+    await writeFile(join(tmpDir, 'assets', asset.file), data);
+    written.push({ ...asset, data, sha256: sha256(data) });
   }
-  const cssFiles = files.filter((asset) => asset.mimeType === 'text/css');
-  for (const asset of cssFiles) {
-    const css = asset.data.toString('utf8');
-    await writeFile(join(tmpDir, 'assets', asset.file), rewriteCss(css, asset.url, assets));
-  }
+  const assetBytes = written.reduce((sum, { data }) => sum + data.length, 0);
 
   const { html, unresolved } = rewriteDocument(captured.html, finalUrl, assets);
   const documentBytes = Buffer.byteLength(html);
@@ -223,7 +237,7 @@ async function writeBundle(tmpDir, { url, finalUrl, captured, egress, startedAt,
     capturedAt: new Date().toISOString(),
     captureSeconds: Math.round((Date.now() - startedAt) / 100) / 10,
     document: { file: 'index.html', bytes: documentBytes },
-    assets: files.map(({ url: source, file, mimeType, data, sha256: digest }) => ({
+    assets: written.map(({ url: source, file, mimeType, data, sha256: digest }) => ({
       file: `assets/${file}`,
       sourceUrl: source,
       mimeType,
@@ -231,7 +245,7 @@ async function writeBundle(tmpDir, { url, finalUrl, captured, egress, startedAt,
       sha256: digest,
     })),
     screenshots,
-    unresolvedRefs: unresolved,
+    unresolvedRefs: [...new Set([...unresolved, ...cssUnresolved])],
     skipped,
     egress,
     totalBytes: documentBytes + assetBytes,
@@ -273,24 +287,29 @@ export async function captureUrl(rawUrl, options) {
     browser = await launchBrowser({ chromeBin, proxyUrl: proxy.url });
     const cdp = await connectCdp(browser.wsUrl);
     const mainHost = url.hostname.replace(/^\[|\]$/g, '');
-    const blocked = () => proxy.events.some((event) => event.decision === 'refused' && event.host === mainHost);
-    const blockedError = () => new CaptureError('capture_blocked', 'page host resolves to a non-public address');
+    const policyRefusals = () => proxy.events.filter((event) => event.decision === 'refused' && event.reason !== 'dns_failed');
+    const blockedError = (refusals) => {
+      const refusal = refusals.find((event) => event.host === mainHost) ?? refusals[0];
+      return new CaptureError('capture_blocked', BLOCKED_MESSAGES[refusal.reason]);
+    };
     let captured;
     try {
       captured = await capturePage(cdp, url);
     } catch (error) {
-      if (blocked()) throw blockedError();
+      const refusals = policyRefusals();
+      if (refusals.length > 0) throw blockedError(refusals);
       throw error;
     } finally {
       cdp.close();
     }
-    if (blocked()) throw blockedError();
+    const mainRefusals = policyRefusals().filter((event) => event.host === mainHost);
+    if (mainRefusals.length > 0) throw blockedError(mainRefusals);
 
     const egress = summarizeEgress(proxy.events);
     const skipped = [...captured.missing];
     const manifest = await writeBundle(tmpDir, {
       url,
-      finalUrl: url.href,
+      finalUrl: captured.finalUrl,
       captured,
       egress,
       startedAt,

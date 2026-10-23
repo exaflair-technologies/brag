@@ -7,6 +7,16 @@ const ATTR_RE = /(\s)(src|href|poster|data-src|srcset|data-srcset)(\s*=\s*)("([^
 const CSS_URL_RE = /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi;
 const HEAD_RE = /<head\b[^>]*>/i;
 const NO_REWRITE_RE = /^(data:|blob:|#|javascript:|mailto:|about:)/i;
+const STYLESHEET_REL_RE = /\brel\s*=\s*["']?[^"'>]*\bstylesheet\b/i;
+const NAMED_ENTITIES = { amp: '&', quot: '"', apos: "'", lt: '<', gt: '>' };
+
+const decodeAttribute = (value) => value.replace(/&(amp|quot|apos|lt|gt);/gi, (_, name) => NAMED_ENTITIES[name.toLowerCase()]);
+
+function isStylesheetLinkAt(html, offset) {
+  const start = html.lastIndexOf('<', offset);
+  const end = html.indexOf('>', offset);
+  return /^<link\b/i.test(html.slice(start, start + 5)) && STYLESHEET_REL_RE.test(html.slice(start, end));
+}
 
 function resolveUrl(raw, base) {
   const value = raw.trim();
@@ -20,18 +30,21 @@ function resolveUrl(raw, base) {
   }
 }
 
-export function rewriteCss(css, cssUrl, assets) {
+export function rewriteCss(css, cssUrl, assets, unresolved = new Set()) {
   return css.replace(CSS_URL_RE, (match, quote, raw) => {
     const absolute = resolveUrl(raw, cssUrl);
-    const local = absolute && assets.get(absolute);
-    return local ? `url(${quote}${local}${quote})` : match;
+    if (!absolute) return match;
+    const local = assets.get(absolute);
+    if (local) return `url(${quote}${local}${quote})`;
+    unresolved.add(absolute);
+    return match;
   });
 }
 
 export function rewriteDocument(html, pageUrl, assets) {
   const unresolved = new Set();
   const localize = (raw) => {
-    const absolute = resolveUrl(raw, pageUrl);
+    const absolute = resolveUrl(decodeAttribute(raw), pageUrl);
     if (!absolute) return null;
     if (assets.has(absolute)) return `assets/${assets.get(absolute)}`;
     return { unresolved: absolute };
@@ -39,7 +52,7 @@ export function rewriteDocument(html, pageUrl, assets) {
 
   let out = html.replace(SCRIPT_RE, '').replace(PRELOAD_LINK_RE, '');
 
-  out = out.replace(ATTR_RE, (match, space, name, equals, quoted, dq, sq) => {
+  out = out.replace(ATTR_RE, (match, space, name, equals, quoted, dq, sq, offset, whole) => {
     const value = dq ?? sq;
     const quote = quoted[0];
     if (name.endsWith('srcset')) {
@@ -59,7 +72,7 @@ export function rewriteDocument(html, pageUrl, assets) {
     if (typeof result === 'string') {
       return `${space}${name}${equals}${quote}${result}${quote}`;
     }
-    if (result && name !== 'href') unresolved.add(result.unresolved);
+    if (result && (name !== 'href' || isStylesheetLinkAt(whole, offset))) unresolved.add(result.unresolved);
     return match;
   });
 
