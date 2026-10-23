@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "brag.run-event.v1",
+  "title": "Brag run event",
+  "description": "One JSON line per event on stderr from the capture worker.",
+  "type": "object",
+  "required": ["type", "ts"],
+  "properties": {
+    "type": { "enum": ["capture.start", "capture.cache_hit", "capture.done"] },
+    "ts": { "type": "string", "format": "date-time" },
+    "bundleId": { "type": "string", "pattern": "^b_[0-9a-f]{16}$" },
+    "bytes": { "type": "integer", "minimum": 0 },
+    "assets": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": false
+}

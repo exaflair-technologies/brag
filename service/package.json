@@ -1,0 +1,13 @@
+{
+  "name": "brag-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Brag capture worker (EXA-930). Zero runtime dependencies; uses the system Chrome.",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test worker/capture/capture.test.mjs"
+  }
+}
